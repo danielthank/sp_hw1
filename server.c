@@ -4,6 +4,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -52,12 +53,29 @@ static int handle_read(request* reqP);
 // error code:
 // -1: client connection error
 
+int new_connection()
+{
+    struct sockaddr_in cliaddr;
+    int clilen = sizeof(cliaddr);
+    int conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
+    if (conn_fd < 0) {
+        if (errno == EINTR || errno == EAGAIN) return -1;  // try again
+        if (errno == ENFILE) {
+            (void) fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
+            return -1;
+        }
+        ERR_EXIT("accept")
+    }
+    requestP[conn_fd].conn_fd = conn_fd;
+    strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
+    fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
+    return conn_fd;
+}
+
 int main(int argc, char** argv) {
+    close(0);
+    close(1);
     int i, ret;
-
-    struct sockaddr_in cliaddr;  // used by accept()
-    int clilen;
-
     int conn_fd;  // fd for a new connection with client
     int file_fd;  // fd for file that we open for reading
     char buf[512];
@@ -87,41 +105,45 @@ int main(int argc, char** argv) {
     // Loop for handling connections
     fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
 
+    fd_set read_master, read_working;
+    FD_ZERO(&read_master);
+    FD_SET(svr.listen_fd, &read_master);
+
     while (1) {
-        // TODO: Add IO multiplexing
-        
-        // Check new connection
-        clilen = sizeof(cliaddr);
-        conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
-        if (conn_fd < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;  // try again
-            if (errno == ENFILE) {
-                (void) fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
-                continue;
+        fprintf(stderr, "monitoring: ");
+        for (int i=0; i<maxfd; i++){
+            if (FD_ISSET(i, &read_master)) {
+                fprintf(stderr, "%d ", i);
             }
-            ERR_EXIT("accept")
         }
-        requestP[conn_fd].conn_fd = conn_fd;
-        strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
-        fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
-
-
-		ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
-		if (ret < 0) {
-			fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
-			continue;
-		}
+        fprintf(stderr, "\n");
+        memcpy(&read_working, &read_master, sizeof(read_master));
+        select(maxfd, &read_working, NULL, NULL, NULL);
+        for (conn_fd=0; conn_fd<maxfd; conn_fd++) {
+            if (FD_ISSET(conn_fd, &read_working)) {
+                if (conn_fd == svr.listen_fd) {
+                    if ((i = new_connection()) < 0) continue;
+                    FD_SET(i, &read_master);
+                }
+                else {
+                    ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
+                    if (ret < 0) {
+                        fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
+                        continue;
+                    }
 
 #ifdef READ_SERVER
-		sprintf(buf,"%s : %s\n",accept_read_header,requestP[conn_fd].buf);
-		write(requestP[conn_fd].conn_fd, buf, strlen(buf));
+                    sprintf(buf,"%s : %s\n",accept_read_header,requestP[conn_fd].buf);
+                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));
 #else
-		sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
-		write(requestP[conn_fd].conn_fd, buf, strlen(buf));
+                    sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
+                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));
 #endif
-
-		close(requestP[conn_fd].conn_fd);
-		free_request(&requestP[conn_fd]);
+                    free_request(&requestP[conn_fd]);
+                    FD_CLR(conn_fd, &read_master);
+                }
+            }
+        }
     }
     free(requestP);
     return 0;
@@ -147,6 +169,7 @@ static void free_request(request* reqP) {
         free(reqP->filename);
         reqP->filename = NULL;
     }*/
+    close(requestP[conn_fd].conn_fd);
     init_request(reqP);
 }
 
