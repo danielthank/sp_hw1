@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include "bidding.h"
 
 #define ERR_EXIT(a) { perror(a); exit(1); }
 
@@ -73,8 +74,8 @@ int new_connection()
 }
 
 int main(int argc, char** argv) {
-    close(0);
-    close(1);
+    BiddingSystem bs;
+    load_items(&bs, "item_list");
     int i, ret;
     int conn_fd;  // fd for a new connection with client
     int file_fd;  // fd for file that we open for reading
@@ -169,7 +170,7 @@ static void free_request(request* reqP) {
         free(reqP->filename);
         reqP->filename = NULL;
     }*/
-    close(requestP[conn_fd].conn_fd);
+    close(reqP->conn_fd);
     init_request(reqP);
 }
 
