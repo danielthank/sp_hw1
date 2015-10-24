@@ -228,6 +228,7 @@ int main(int argc, char** argv) {
 
     // Get file descripter table size and initize request table
     maxfd = getdtablesize();
+    if (FD_SETSIZE < maxfd) maxfd = FD_SETSIZE;
     requestP = (request*) malloc(sizeof(request) * maxfd);
     if (requestP == NULL) {
         ERR_EXIT("out of memory allocating all requests");
