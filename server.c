@@ -9,7 +9,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include "bidding.h"
 
 #define ERR_EXIT(a) { perror(a); exit(1); }
 
@@ -29,6 +28,13 @@ typedef struct {
     int wait_for_write;  // used by handle_read to know if the header is read or not.
 } request;
 
+typedef struct {
+    int id;
+    int amount;
+    int price;
+} Item;
+int locked[20];
+
 server svr;  // server
 request* requestP = NULL;  // point to a list of requests
 int maxfd;  // size of open file descriptor table, size of request list
@@ -44,7 +50,7 @@ static void init_server(unsigned short port);
 static void init_request(request* reqP);
 // initailize a request instance
 
-static void free_request(request* reqP);
+static void free_request(request* reqP, int itemfd, fd_set* set);
 // free resources used by a request instance
 
 static int handle_read(request* reqP);
@@ -73,20 +79,149 @@ int new_connection()
     return conn_fd;
 }
 
+void print_error(request *p, char *errormsg) {
+    fprintf(stderr, "%s from %s\n", errormsg, p->host);
+}
+
+int set_lock(int item_fd, int index) {
+    struct flock lock;
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = index * sizeof(Item);
+    lock.l_len = sizeof(Item);
+    locked[index] = 1;
+    return fcntl(item_fd, F_SETLK, &lock);
+}
+
+int un_lock(int item_fd, int index) {
+    struct flock lock;
+    lock.l_type = F_UNLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = index * sizeof(Item);
+    lock.l_len = sizeof(Item);
+    locked[index] = 0;
+    return fcntl(item_fd, F_SETLK, &lock);
+}
+
+int check_lock(int item_fd, int index) {
+    struct flock lock;
+    lock.l_type = F_RDLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = index * sizeof(Item);
+    lock.l_len = sizeof(Item);
+    if (fcntl(item_fd, F_GETLK, &lock) < 0) return -1;
+    return (lock.l_type != F_UNLCK || locked[index]);
+}
+
+void print_client(request *p, char *msg) {
+    write(p->conn_fd, msg, strlen(msg));
+}
+
+// mode 0: read, 1: write
+void handle_cmd(request *p, int item_fd, fd_set *set, int mode) {
+    char buffer[1024];
+    if (mode == 0) {
+        p->item = atoi(p->buf);
+        int index = p->item - 1;
+        int flag = check_lock(item_fd, index);
+        if (flag < 0) {
+            print_error(p, "Unable to check lock");
+            free_request(p, item_fd, set);
+            return;
+        }
+        else if (flag == 0) {
+            Item now;
+            lseek(item_fd, index * sizeof(Item), SEEK_SET);
+            read(item_fd, &now, sizeof(Item));
+            sprintf(buffer, "item%d $%d remain: %d\n", now.id, now.price, now.amount);
+        }
+        else sprintf(buffer, "This item is locked.\n");
+        print_client(p, buffer);
+        free_request(p, item_fd, set);
+    }
+    else {
+        if (!p->item) {
+            p->item = atoi(p->buf);
+            int index = p->item - 1;
+            int flag = check_lock(item_fd, index);
+            if (flag < 0) {
+                print_error(p, "Unable to check lock");
+                free_request(p, item_fd, set);
+                return;
+            }
+            else if (flag == 0) {
+                if (set_lock(item_fd, index) < 0) {
+                    print_error(p, "Unable to set lock");
+                    free_request(p, item_fd, set);
+                    return;
+                }
+                print_client(p, "This item is modifiable.\n");
+            }
+            else {
+                print_client(p, "This item is locked.\n");
+                free_request(p, item_fd, set);
+            }
+        }
+        else {
+            int index = p->item - 1;
+            Item now;
+            lseek(item_fd, index * sizeof(Item), SEEK_SET);
+            read(item_fd, &now, sizeof(Item));
+            char cmd[1024];
+            int amount;
+            sscanf(p->buf, "%s%d", cmd, &amount);
+            if (strcmp(cmd, "buy") == 0) {
+                if (now.amount - amount < 0) {
+                    print_client(p, "Operation failed.\n");
+                    free_request(p, item_fd, set);
+                    return;
+                }
+                now.amount -= amount;
+            }
+            else if (strcmp(cmd, "sell") == 0) {
+                if (amount < 0) {
+                    print_client(p, "Operation failed.\n");
+                    free_request(p, item_fd, set);
+                    return;
+                }
+                now.amount += amount;
+            } 
+            else if (strcmp(cmd, "price") == 0) {
+                if (amount < 0) {
+                    print_client(p, "Operation failed.\n");
+                    free_request(p, item_fd, set);
+                    return;
+                }
+                now.price = amount;
+            }
+            else {
+                print_error(p, "Bad request");
+                free_request(p, item_fd, set);
+                return;
+            }
+            lseek(item_fd, index * sizeof(Item), SEEK_SET);
+            write(item_fd, (char*)&now, sizeof(Item));
+            free_request(p, item_fd, set);
+        }
+    }
+
+}
+
 int main(int argc, char** argv) {
-    BiddingSystem bs;
-    load_items(&bs, "item_list");
-    int i, ret;
     int conn_fd;  // fd for a new connection with client
     int file_fd;  // fd for file that we open for reading
-    char buf[512];
-    int buf_len;
+#ifdef read_server
+    int item_fd = open("item_list", O_RDONLY);
+#else
+    int item_fd = open("item_list", O_RDWR);
+#endif
 
     // Parse args.
     if (argc != 2) {
         fprintf(stderr, "usage: %s [port]\n", argv[0]);
         exit(1);
     }
+    memset(locked, 0, sizeof(locked));
 
     // Initialize server
     init_server((unsigned short) atoi(argv[1]));
@@ -97,13 +232,12 @@ int main(int argc, char** argv) {
     if (requestP == NULL) {
         ERR_EXIT("out of memory allocating all requests");
     }
-    for (i = 0; i < maxfd; i++) {
+    for (int i = 0; i < maxfd; i++) {
         init_request(&requestP[i]);
     }
     requestP[svr.listen_fd].conn_fd = svr.listen_fd;
     strcpy(requestP[svr.listen_fd].host, svr.hostname);
 
-    // Loop for handling connections
     fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
 
     fd_set read_master, read_working;
@@ -123,25 +257,23 @@ int main(int argc, char** argv) {
         for (conn_fd=0; conn_fd<maxfd; conn_fd++) {
             if (FD_ISSET(conn_fd, &read_working)) {
                 if (conn_fd == svr.listen_fd) {
-                    if ((i = new_connection()) < 0) continue;
-                    FD_SET(i, &read_master);
+                    int new_fd;
+                    if ((new_fd = new_connection()) < 0) continue;
+                    FD_SET(new_fd, &read_master);
                 }
                 else {
-                    ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
+                    int ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
                     if (ret < 0) {
-                        fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
+                        print_error(&requestP[conn_fd], "Bad request");
+                        free_request(&requestP[conn_fd], item_fd, &read_master);
                         continue;
                     }
-
+                    else if(ret == 0) continue;
 #ifdef READ_SERVER
-                    sprintf(buf,"%s : %s\n",accept_read_header,requestP[conn_fd].buf);
-                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));
+                    handle_cmd(&requestP[conn_fd], item_fd, &read_master, 0);
 #else
-                    sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
-                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));
+                    handle_cmd(&requestP[conn_fd], item_fd, &read_master, 1);
 #endif
-                    free_request(&requestP[conn_fd]);
-                    FD_CLR(conn_fd, &read_master);
                 }
             }
         }
@@ -153,7 +285,6 @@ int main(int argc, char** argv) {
 
 // ======================================================================================================
 // You don't need to know how the following codes are working
-#include <fcntl.h>
 
 static void* e_malloc(size_t size);
 
@@ -165,13 +296,17 @@ static void init_request(request* reqP) {
     reqP->wait_for_write = 0;
 }
 
-static void free_request(request* reqP) {
+static void free_request(request* p, int item_fd, fd_set *set) {
     /*if (reqP->filename != NULL) {
         free(reqP->filename);
         reqP->filename = NULL;
     }*/
-    close(reqP->conn_fd);
-    init_request(reqP);
+    if (p->item)
+        if (un_lock(item_fd, p->item-1) < 0)
+            print_error(p, "Unable to unlock");
+    FD_CLR(p->conn_fd, set);
+    close(p->conn_fd);
+    init_request(p);
 }
 
 // return 0: socket ended, request done.
@@ -185,17 +320,12 @@ static int handle_read(request* reqP) {
 
     // Read in request from client
     r = read(reqP->conn_fd, buf, sizeof(buf));
-    if (r < 0) return -1;
+    if (r < 0 || buf[0] == -1) return -1;
     if (r == 0) return 0;
 	char* p1 = strstr(buf, "\015\012");
-	int newline_len = 2;
 	// be careful that in Windows, line ends with \015\012
 	if (p1 == NULL) {
 		p1 = strstr(buf, "\012");
-		newline_len = 1;
-		if (p1 == NULL) {
-			ERR_EXIT("this really should not happen...");
-		}
 	}
 	size_t len = p1 - buf + 1;
 	memmove(reqP->buf, buf, len);
