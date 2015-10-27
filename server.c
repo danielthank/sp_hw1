@@ -50,7 +50,7 @@ static void init_server(unsigned short port);
 static void init_request(request* reqP);
 // initailize a request instance
 
-static void free_request(request* reqP, int itemfd, fd_set* set);
+static void free_request(request* reqP, int itemfd, fd_set* set, char unlock);
 // free resources used by a request instance
 
 static int handle_read(request* reqP);
@@ -126,7 +126,7 @@ void handle_cmd(request *p, int item_fd, fd_set *set, int mode) {
         int flag = check_lock(item_fd, index);
         if (flag < 0) {
             print_error(p, "Unable to check lock");
-            free_request(p, item_fd, set);
+            free_request(p, item_fd, set, 1);
             return;
         }
         else if (flag == 0) {
@@ -137,7 +137,7 @@ void handle_cmd(request *p, int item_fd, fd_set *set, int mode) {
         }
         else sprintf(buffer, "This item is locked.\n");
         print_client(p, buffer);
-        free_request(p, item_fd, set);
+        free_request(p, item_fd, set, 0);
     }
     else {
         if (!p->item) {
@@ -146,20 +146,20 @@ void handle_cmd(request *p, int item_fd, fd_set *set, int mode) {
             int flag = check_lock(item_fd, index);
             if (flag < 0) {
                 print_error(p, "Unable to check lock");
-                free_request(p, item_fd, set);
+                free_request(p, item_fd, set, 1);
                 return;
             }
             else if (flag == 0) {
                 if (set_lock(item_fd, index) < 0) {
                     print_error(p, "Unable to set lock");
-                    free_request(p, item_fd, set);
+                    free_request(p, item_fd, set, 1);
                     return;
                 }
                 print_client(p, "This item is modifiable.\n");
             }
             else {
                 print_client(p, "This item is locked.\n");
-                free_request(p, item_fd, set);
+                free_request(p, item_fd, set, 0);
             }
         }
         else {
@@ -171,9 +171,9 @@ void handle_cmd(request *p, int item_fd, fd_set *set, int mode) {
             int amount;
             sscanf(p->buf, "%s%d", cmd, &amount);
             if (strcmp(cmd, "buy") == 0) {
-                if (now.amount - amount < 0) {
+                if (amount < 0 || now.amount - amount < 0) {
                     print_client(p, "Operation failed.\n");
-                    free_request(p, item_fd, set);
+                    free_request(p, item_fd, set, 1);
                     return;
                 }
                 now.amount -= amount;
@@ -181,7 +181,7 @@ void handle_cmd(request *p, int item_fd, fd_set *set, int mode) {
             else if (strcmp(cmd, "sell") == 0) {
                 if (amount < 0) {
                     print_client(p, "Operation failed.\n");
-                    free_request(p, item_fd, set);
+                    free_request(p, item_fd, set, 1);
                     return;
                 }
                 now.amount += amount;
@@ -189,19 +189,19 @@ void handle_cmd(request *p, int item_fd, fd_set *set, int mode) {
             else if (strcmp(cmd, "price") == 0) {
                 if (amount < 0) {
                     print_client(p, "Operation failed.\n");
-                    free_request(p, item_fd, set);
+                    free_request(p, item_fd, set, 1);
                     return;
                 }
                 now.price = amount;
             }
             else {
                 print_error(p, "Bad request");
-                free_request(p, item_fd, set);
+                free_request(p, item_fd, set, 1);
                 return;
             }
             lseek(item_fd, index * sizeof(Item), SEEK_SET);
             write(item_fd, (char*)&now, sizeof(Item));
-            free_request(p, item_fd, set);
+            free_request(p, item_fd, set, 1);
         }
     }
 
@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
                     int ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
                     if (ret < 0) {
                         print_error(&requestP[conn_fd], "Bad request");
-                        free_request(&requestP[conn_fd], item_fd, &read_master);
+                        free_request(&requestP[conn_fd], item_fd, &read_master, 1);
                         continue;
                     }
                     else if(ret == 0) continue;
@@ -297,12 +297,12 @@ static void init_request(request* reqP) {
     reqP->wait_for_write = 0;
 }
 
-static void free_request(request* p, int item_fd, fd_set *set) {
+static void free_request(request* p, int item_fd, fd_set *set, char unlock) {
     /*if (reqP->filename != NULL) {
         free(reqP->filename);
         reqP->filename = NULL;
     }*/
-    if (p->item)
+    if (unlock && p->item)
         if (un_lock(item_fd, p->item-1) < 0)
             print_error(p, "Unable to unlock");
     FD_CLR(p->conn_fd, set);
